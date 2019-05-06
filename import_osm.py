@@ -1,250 +1,37 @@
+import os
+import math
+import xml.etree.ElementTree as etree
+from bpy_extras.io_utils import ImportHelper
+import bpy
+import bmesh
 bl_info = {
     "name": "Import OpenStreetMap (.osm)",
-    "author": "Vladimir Elistratov, gtoonstra and @lapka_td",
-    "version": (1, 0, 1),
-    "blender": (2, 7, 7),
+    "author": "@lapka_td",
+    "version": (1, 1, 0),
+    "blender": (2, 77, 0),
     "location": "File > Import > OpenStreetMap (.osm)",
     "description": "Import a file in the OpenStreetMap format (.osm)",
     "url": 'https://github.com/olesya-wo/osm-import',
     "wiki_url": "https://github.com/olesya-wo/osm-import/wiki",
     "tracker_url": "https://github.com/olesya-wo/osm-import/issues",
     "support": "COMMUNITY",
-    "category": "Import-Export",
+    "category": "Import-Export"
 }
 
-import bpy, bmesh
-# ImportHelper is a helper class, defines filename and invoke() function which calls the file selector
-from bpy_extras.io_utils import ImportHelper
 
-import os
-import math
-
-# see conversion formulas at
-# http://en.wikipedia.org/wiki/Transverse_Mercator_projection
-# and
-# http://mathworld.wolfram.com/MercatorProjection.html
-class TransverseMercator:
-    radius = 6378137
-
-    def __init__(self, **kwargs):
-        # setting default values
-        self.lat = 0 # in degrees
-        self.lon = 0 # in degrees
-        self.k = 1 # scale factor
-        
-        for attr in kwargs:
-            setattr(self, attr, kwargs[attr])
-        self.latInRadians = math.radians(self.lat)
-
-    def fromGeographic(self, lat, lon):
-        lat = math.radians(lat)
-        lon = math.radians(lon-self.lon)
-        B = math.sin(lon) * math.cos(lat)
-        x = 0.5 * self.k * self.radius * math.log((1+B)/(1-B))
-        y = self.k * self.radius * ( math.atan(math.tan(lat)/math.cos(lon)) - self.latInRadians )
-        return (x,y)
-
-    def toGeographic(self, x, y):
-        x = x/(self.k * self.radius)
-        y = y/(self.k * self.radius)
-        D = y + self.latInRadians
-        lon = math.atan(math.sinh(x)/math.cos(D))
-        lat = math.asin(math.sin(D)/math.cosh(x))
-
-        lon = self.lon + math.degrees(lon)
-        lat = math.degrees(lat)
-        return (lat, lon)
-
-import xml.etree.cElementTree as etree
-import inspect, importlib
-
-def prepareHandlers(kwArgs):
-    nodeHandlers = []
-    wayHandlers = []
-    # getting a dictionary with local variables
-    _locals = locals()
-    for handlers in ("nodeHandlers", "wayHandlers"):
-        if handlers in kwArgs:
-            for handler in kwArgs[handlers]:
-                if isinstance(handler, str):
-                    # we've got a module name
-                    handler = importlib.import_module(handler)
-                if inspect.ismodule(handler):
-                    # iterate through all module functions
-                    for f in inspect.getmembers(handler, inspect.isclass):
-                        _locals[handlers].append(f[1])
-                elif inspect.isclass(handler):
-                    _locals[handlers].append(handler)
-        if len(_locals[handlers])==0: _locals[handlers] = None
-    return (nodeHandlers if len(nodeHandlers) else None, wayHandlers if len(wayHandlers) else None)
-
-class OsmParser:
-    
-    def __init__(self, filename, **kwargs):
-        self.nodes = {}
-        self.ways = {}
-        self.relations = {}
-        self.minLat = 90
-        self.maxLat = -90
-        self.minLon = 180
-        self.maxLon = -180
-        # self.bounds contains the attributes of the bounds tag of the .osm file if available
-        self.bounds = None
-        
-        (self.nodeHandlers, self.wayHandlers) = prepareHandlers(kwargs)
-        
-        self.doc = etree.parse(filename)
-        self.osm = self.doc.getroot()
-        self.prepare()
-
-    # A 'node' in osm:  <node id="2599524395" visible="true" version="1" changeset="19695235" timestamp="2013-12-29T12:40:05Z" user="It's so funny_BAG" uid="1204291" lat="52.0096203" lon="4.3612318"/>
-    # A 'way' in osm: 
-    #  <way id="254138613" visible="true" version="1" changeset="19695235" timestamp="2013-12-29T12:58:34Z" user="It's so funny_BAG" uid="1204291">
-    #  <nd ref="2599536906"/>
-    #  <nd ref="2599537009"/>
-    #  <nd ref="2599537013"/>
-    #  <nd ref="2599537714"/>
-    #  <nd ref="2599537988"/>
-    #  <nd ref="2599537765"/>
-    #  <nd ref="2599536906"/>
-    #  <tag k="building" v="yes"/>
-    #  <tag k="ref:bag" v="503100000022259"/>
-    #  <tag k="source" v="BAG"/>
-    #  <tag k="source:date" v="2013-11-26"/>
-    #  <tag k="start_date" v="1850"/>
-    #  </way>
-    #
-    # The parser creates two dictionaries: {}
-    #   parser.nodes[ node_id ] = { "lat":lat, "lon":lon, "e":e, "_id":_id }
-    #   parser.ways[ way_id ] = { "nodes":["12312312","1312313123","345345453",etc..], "tags":{"building":"yes", etc...}, "e":e, "_id":_id }
-    # So the way data is stored can seem a little complex
-    #
-    # The parser is then passed, along with the 'way' or 'node' object of the parser
-    # to the handler functions of buildings, highways, etc, where they are used to convert them into blender objects.
-    #
-    def prepare(self):
-        allowedTags = set(("node", "way", "bounds"))
-        for e in self.osm: # e stands for element
-            attrs = e.attrib
-            if e.tag not in allowedTags : continue
-            if "action" in attrs and attrs["action"] == "delete": continue
-            if e.tag == "node":
-                _id = attrs["id"]
-                tags = None
-                for c in e:
-                    if c.tag == "tag":
-                        if not tags: tags = {}
-                        tags[c.get("k")] = c.get("v")
-                lat = float(attrs["lat"])
-                lon = float(attrs["lon"])
-                # calculating minLat, maxLat, minLon, maxLon
-                # commented out: only imported objects take part in the extent calculation
-                #if lat<self.minLat: self.minLat = lat
-                #elif lat>self.maxLat: self.maxLat = lat
-                #if lon<self.minLon: self.minLon = lon
-                #elif lon>self.maxLon: self.maxLon = lon
-                # creating entry
-                entry = dict(
-                    id=_id,
-                    e=e,
-                    lat=lat,
-                    lon=lon
-                )
-                if tags: entry["tags"] = tags
-                self.nodes[_id] = entry
-            elif e.tag == "way":
-                _id = attrs["id"]
-                nodes = []
-                tags = None
-                for c in e:
-                    if c.tag == "nd":
-                        nodes.append(c.get("ref"))
-                    elif c.tag == "tag":
-                        if not tags: tags = {}
-                        tags[c.get("k")] = c.get("v")
-                # ignore ways without tags
-                if tags:
-                    self.ways[_id] = dict(
-                        id=_id,
-                        e=e,
-                        nodes=nodes,
-                        tags=tags
-                    )
-            elif e.tag == "bounds":
-                self.bounds = {
-                    "minLat": float(attrs["minlat"]),
-                    "minLon": float(attrs["minlon"]),
-                    "maxLat": float(attrs["maxlat"]),
-                    "maxLon": float(attrs["maxlon"])
-                }
-        
-        self.calculateExtent()
-
-    def iterate(self, wayFunction, nodeFunction):
-        nodeHandlers = self.nodeHandlers
-        wayHandlers = self.wayHandlers
-        
-        if wayHandlers:
-            for _id in self.ways:
-                way = self.ways[_id]
-                if "tags" in way:
-                    for handler in wayHandlers:
-                        if handler.condition(way["tags"], way):
-                            wayFunction(way, handler)
-                            continue
-        
-        if nodeHandlers:
-            for _id in self.nodes:
-                node = self.nodes[_id]
-                if "tags" in node:
-                    for handler in nodeHandlers:
-                        if handler.condition(node["tags"], node):
-                            nodeFunction(node, handler)
-                            continue
-
-    def parse(self, **kwargs):
-        def wayFunction(way, handler):
-            handler.handler(way, self, kwargs)
-        def nodeFunction(node, handler):
-            handler.handler(node, self, kwargs)
-        self.iterate(wayFunction, nodeFunction)
-
-    def calculateExtent(self):
-        def wayFunction(way, handler):
-            wayNodes = way["nodes"]
-            for node in range(len(wayNodes)-1): # skip the last node which is the same as the first ones
-                nodeFunction(self.nodes[wayNodes[node]])
-        def nodeFunction(node, handler=None):
-            lon = node["lon"]
-            lat = node["lat"]
-            if lat<self.minLat: self.minLat = lat
-            elif lat>self.maxLat: self.maxLat = lat
-            if lon<self.minLon: self.minLon = lon
-            elif lon>self.maxLon: self.maxLon = lon
-        self.iterate(wayFunction, nodeFunction)
-
-
-import bpy, bmesh
-
-def extrudeMesh(bm, thickness):
-    """
-    Extrude bmesh
-    """
+def extrude_mesh(bm, thickness):
     geom = bmesh.ops.extrude_face_region(bm, geom=bm.faces)
     verts_extruded = [v for v in geom["geom"] if isinstance(v, bmesh.types.BMVert)]
     bmesh.ops.translate(bm, verts=verts_extruded, vec=(0, 0, thickness))
-def extrudeEdges(bm, thickness):
-    """
-    Extrude bmesh
-    """
+
+
+def extrude_edges(bm, thickness):
     geom = bmesh.ops.extrude_face_region(bm, geom=bm.edges)
     verts_extruded = [v for v in geom["geom"] if isinstance(v, bmesh.types.BMVert)]
     bmesh.ops.translate(bm, verts=verts_extruded, vec=(0, 0, thickness))
 
 
-
-def assignMaterials(obj, materialname, color, faces):
-    # Get material
+def assign_materials(obj, materialname, color, faces):
     if bpy.data.materials.get(materialname) is not None:
         mat = bpy.data.materials[materialname]
     else:
@@ -252,362 +39,35 @@ def assignMaterials(obj, materialname, color, faces):
         mat = bpy.data.materials.new(name=materialname)
         mat.diffuse_color = color
 
-    # Assign it to object
     matidx = len(obj.data.materials)
-    obj.data.materials.append(mat) 
+    obj.data.materials.append(mat)
 
     for face in faces:
         face.material_index = matidx
 
 
-def assignTags(obj, tags):
-    for key in tags:
-        obj[key] = tags[key]
-
-
-def parse_scalar_and_unit( htag ):
-    for i,c in enumerate(htag):
+def parse_scalar_and_unit(htag):
+    # TODO add float support
+    # TODO add unit conversion
+    for i, c in enumerate(htag):
         if not c.isdigit():
             return int(htag[:i]), htag[i:].strip()
-
     return int(htag), ""
 
 
-class Buildings:
-    @staticmethod
-    def condition(tags, way):
-        return "building" in tags
-    
-    @staticmethod
-    def handler(way, parser, kwargs):
-        wayNodes = way["nodes"]
-        numNodes = len(wayNodes)-1 # we need to skip the last node which is the same as the first ones
-        # a polygon must have at least 3 vertices
-        if numNodes<3: return
-        
-        tags = way["tags"]
-        osmId = way["id"]
-        # compose object name
-        name = osmId
-        if "addr:housenumber" in tags and "addr:street" in tags:
-            name = tags["addr:street"] + ", " + tags["addr:housenumber"]
-        elif "name" in tags:
-            name = tags["name"]
-        
-        bm = bmesh.new()
-        verts = []
-        for node in range(numNodes):
-            node = parser.nodes[wayNodes[node]]
-            v = kwargs["projection"].fromGeographic(node["lat"], node["lon"])
-            verts.append( bm.verts.new((v[0], v[1], 0)) )
-        
-        bm.faces.new(verts)
-        
-        tags = way["tags"]
-        thickness = 0
-        if "height" in tags:
-            # There's a height tag. It's parsed as text and could look like: 25, 25m, 25 ft, etc.
-            thickness,unit = parse_scalar_and_unit(tags["height"])
-        elif "building:levels" in tags:
-            thickness,unit = parse_scalar_and_unit(tags["building:levels"])
-            thickness *= 3
-        else:
-            thickness = 3
-
-        # extrude
-        if thickness>0:
-            extrudeMesh(bm, thickness)
-        
-        bm.normal_update()
-        
-        mesh = bpy.data.meshes.new(osmId)
-        bm.to_mesh(mesh)
-        
-        obj = bpy.data.objects.new(name, mesh)
-        bpy.context.scene.objects.link(obj)
-        
-        # final adjustments
-        obj.select = True
-        # assign OSM tags to the blender object
-        assignTags(obj, tags)
-
-        assignMaterials( obj, "roof", (1.0,0.0,0.0), [mesh.polygons[0]] )
-        assignMaterials( obj, "building", (1,0.7,0.0), mesh.polygons[1:] )
-
-
-class BuildingParts:
-    @staticmethod
-    def condition(tags, way):
-        return "building:part" in tags
-    
-    @staticmethod
-    def handler(way, parser, kwargs):
-        wayNodes = way["nodes"]
-        numNodes = len(wayNodes)-1 # we need to skip the last node which is the same as the first ones
-        # a polygon must have at least 3 vertices
-        if numNodes<3: return
-        
-        tags = way["tags"]
-        osmId = way["id"]
-        # compose object name
-        name = osmId
-        if "addr:housenumber" in tags and "addr:street" in tags:
-            name = tags["addr:street"] + ", " + tags["addr:housenumber"]
-        elif "name" in tags:
-            name = tags["name"]
-
-        min_height = 0
-        height = 0
-        if "min_height" in tags:
-            # There's a height tag. It's parsed as text and could look like: 25, 25m, 25 ft, etc.
-            min_height,unit = parse_scalar_and_unit(tags["min_height"])
-
-        if "height" in tags:
-            # There's a height tag. It's parsed as text and could look like: 25, 25m, 25 ft, etc.
-            height,unit = parse_scalar_and_unit(tags["height"])
-        if min_height == 0 and height == 0 and "building:levels" in tags:
-            height,unit = parse_scalar_and_unit(tags["building:levels"])
-            height *= 3
-            
-
-        bm = bmesh.new()
-        verts = []
-        for node in range(numNodes):
-            node = parser.nodes[wayNodes[node]]
-            v = kwargs["projection"].fromGeographic(node["lat"], node["lon"])
-            verts.append( bm.verts.new((v[0], v[1], min_height)) )
-        
-        bm.faces.new(verts)
-        
-        tags = way["tags"]
-
-        # extrude
-        if (height-min_height)>0:
-            extrudeMesh(bm, (height-min_height))
-        
-        bm.normal_update()
-        
-        mesh = bpy.data.meshes.new(osmId)
-        bm.to_mesh(mesh)
-        
-        obj = bpy.data.objects.new(name, mesh)
-        bpy.context.scene.objects.link(obj)
-        
-        # final adjustments
-        obj.select = True
-        # assign OSM tags to the blender object
-        assignTags(obj, tags)
-
-
-class Highways:
-    @staticmethod
-    def condition(tags, way):
-        return "highway" in tags
-    
-    @staticmethod
-    def handler(way, parser, kwargs):
-        wayNodes = way["nodes"]
-        numNodes = len(wayNodes) # we need to skip the last node which is the same as the first ones
-        # a way must have at least 2 vertices
-        if numNodes<2: return
-        
-        tags = way["tags"]
-        osmId = way["id"]
-        # compose object name
-        name = tags["name"] if "name" in tags else osmId
-        
-        bm = bmesh.new()
-        prevVertex = None
-        for node in range(numNodes):
-            node = parser.nodes[wayNodes[node]]
-            v = kwargs["projection"].fromGeographic(node["lat"], node["lon"])
-            v = bm.verts.new((v[0], v[1], 0))
-            if prevVertex:
-                bm.edges.new([prevVertex, v])
-            prevVertex = v
-        
-        mesh = bpy.data.meshes.new(osmId)
-        bm.to_mesh(mesh)
-        
-        obj = bpy.data.objects.new(name, mesh)
-        bpy.context.scene.objects.link(obj)
-        
-        # final adjustments
-        obj.select = True
-        # assign OSM tags to the blender object
-        assignTags(obj, tags)
-
-
-class Walls:
-    @staticmethod
-    def condition(tags, way):
-        return "barrier" in tags
-    
-    @staticmethod
-    def handler(way, parser, kwargs):
-        wayNodes = way["nodes"]
-        numNodes = len(wayNodes) # we need to skip the last node which is the same as the first ones
-        # a wall must have at least 2 vertices
-        if numNodes<2: return
-        
-        tags = way["tags"]
-        osmId = way["id"]
-        # compose object name
-        name = tags["name"] if "name" in tags else osmId
-        
-        bm = bmesh.new()
-        prevVertex = None
-        for node in range(numNodes):
-            node = parser.nodes[wayNodes[node]]
-            v = kwargs["projection"].fromGeographic(node["lat"], node["lon"])
-            v = bm.verts.new((v[0], v[1], 0))
-            if prevVertex:
-                bm.edges.new([prevVertex, v])
-            prevVertex = v
-        
-        height = 0
-        if "height" in tags:
-            height,unit = parse_scalar_and_unit(tags["height"])
-        # extrude
-        if height>0:
-            extrudeEdges(bm, height)
-        else:
-            extrudeEdges(bm, 0.5)
-        
-        bm.normal_update()
-        mesh = bpy.data.meshes.new(osmId)
-        bm.to_mesh(mesh)
-        
-        obj = bpy.data.objects.new(name, mesh)
-        bpy.context.scene.objects.link(obj)
-        
-        # final adjustments
-        obj.select = True
-        # assign OSM tags to the blender object
-        assignTags(obj, tags)
-        assignMaterials( obj, tags["barrier"], (0.0,0.0,1.0), [] )
-
-
-class Naturals:
-    @staticmethod
-    def condition(tags, way):
-        return "natural" in tags
-    
-    @staticmethod
-    def handler(way, parser, kwargs):
-        wayNodes = way["nodes"]
-        numNodes = len(wayNodes) # we need to skip the last node which is the same as the first ones
-    
-        if numNodes == 1:
-            # This is some point "natural".
-            # which we ignore for now (trees, etc.)
-            pass
-
-        numNodes = numNodes - 1
-
-        # a polygon must have at least 3 vertices
-        if numNodes<3: return
-        
-        tags = way["tags"]
-        osmId = way["id"]
-        # compose object name
-        name = osmId
-        if "name" in tags:
-            name = tags["name"]
-
-        bm = bmesh.new()
-        verts = []
-        for node in range(numNodes):
-            node = parser.nodes[wayNodes[node]]
-            v = kwargs["projection"].fromGeographic(node["lat"], node["lon"])
-            verts.append( bm.verts.new((v[0], v[1], 0)) )
-        
-        bm.faces.new(verts)
-        
-        tags = way["tags"]
-        bm.normal_update()
-        
-        mesh = bpy.data.meshes.new(osmId)
-        bm.to_mesh(mesh)
-        
-        obj = bpy.data.objects.new(name, mesh)
-        bpy.context.scene.objects.link(obj)
-        
-        # final adjustments
-        obj.select = True
-        # assign OSM tags to the blender object
-        assignTags(obj, tags)
-
-        naturaltype = tags["natural"]
-        color = (0.5,0.5,0.5)
-
-        if naturaltype == "water":
-            color = (0,0,1)
-
-        assignMaterials( obj, naturaltype, color, [mesh.polygons[0]] )
-
-
-class Landuse:
-    @staticmethod
-    def condition(tags, way):
-        return "landuse" in tags
-    
-    @staticmethod
-    def handler(way, parser, kwargs):
-        wayNodes = way["nodes"]
-        numNodes = len(wayNodes) # we need to skip the last node which is the same as the first ones
-
-        numNodes = numNodes - 1
-
-        # a polygon must have at least 3 vertices
-        if numNodes<3: return
-        
-        tags = way["tags"]
-        osmId = way["id"]
-        # compose object name
-        name = osmId
-        if "name" in tags:
-            name = tags["name"]
-
-        bm = bmesh.new()
-        verts = []
-        for node in range(numNodes):
-            node = parser.nodes[wayNodes[node]]
-            v = kwargs["projection"].fromGeographic(node["lat"], node["lon"])
-            verts.append( bm.verts.new((v[0], v[1], 0)) )
-        
-        bm.faces.new(verts)
-        
-        tags = way["tags"]
-        bm.normal_update()
-        
-        mesh = bpy.data.meshes.new(osmId)
-        bm.to_mesh(mesh)
-        
-        obj = bpy.data.objects.new(name, mesh)
-        bpy.context.scene.objects.link(obj)
-        
-        # final adjustments
-        obj.select = True
-        # assign OSM tags to the blender object
-        assignTags(obj, tags)
-
-        naturaltype = tags["landuse"]
-        color = (0.5,0.5,0.5)
-
-        if naturaltype == "grass":
-            color = (0,1,0)
-
-        assignMaterials( obj, naturaltype, color, [mesh.polygons[0]] )
-
-
-class ImportOsm(bpy.types.Operator, ImportHelper):
+class OsmParser(bpy.types.Operator, ImportHelper):
     """Import a file in the OpenStreetMap format (.osm)"""
-    bl_idname = "import_scene.osm"  # important since its how bpy.ops.import_scene.osm is constructed
+    nodes = {}
+    curr_way = None
+    node_tags = set()  # which tags store in the node
+    radius = 6378137
+    lat = 0
+    lon = 0
+    latInRadians = 0
+    bounds = None
+    bl_idname = "import_scene.osm"
     bl_label = "Import OpenStreetMap"
-    bl_options = {"UNDO"}
-
-    # ImportHelper mixin class uses this
+    bl_options = {"REGISTER"}
     filename_ext = ".osm"
 
     filter_glob = bpy.props.StringProperty(
@@ -633,9 +93,9 @@ class ImportOsm(bpy.types.Operator, ImportHelper):
         default=False,
     )
 
-    importWalls = bpy.props.BoolProperty(
-        name="Import walls",
-        description="Import walls",
+    importBarriers = bpy.props.BoolProperty(
+        name="Import barriers",
+        description="Import barriers",
         default=True,
     )
 
@@ -645,100 +105,364 @@ class ImportOsm(bpy.types.Operator, ImportHelper):
         default=True,
     )
 
+    def from_geo(self, lat, lon):
+        lat = math.radians(lat)
+        lon = math.radians(lon - self.lon)
+        b = math.sin(lon) * math.cos(lat)
+        x = 0.5 * self.radius * math.log((1 + b) / (1 - b))
+        y = self.radius * (math.atan(math.tan(lat) / math.cos(lon)) - self.latInRadians)
+        return x, y
+
+    def parse(self, filename):
+        xml_f = open(filename, encoding="UTF-8")
+        self.nodes = {}
+        self.curr_way = None
+        stage = 0  # 0 - need osm, 1 - in osm, 2 - in node, 3 - in way, 4 - in relation
+        last_node = None
+        context = etree.iterparse(xml_f, events=('start',))
+        context = iter(context)
+        _, root = next(context)
+        for event, elem in context:
+            # processing
+            if elem.tag == "osm":
+                stage = 1
+            elif elem.tag == "node":
+                stage = 2
+                if last_node:
+                    if len(last_node["tags"]) == 0:
+                        last_node["tags"] = None
+                    self.nodes[last_node["id"]] = (last_node["lat"], last_node["lon"], last_node["tags"])
+                last_node = {"id": int(elem.attrib.get("id")),
+                             "lat": float(elem.attrib.get("lat")),
+                             "lon": float(elem.attrib.get("lon")),
+                             "tags": {}}
+            elif elem.tag == "way":
+                stage = 3
+                if last_node:
+                    if len(last_node["tags"]) == 0:
+                        last_node["tags"] = None
+                    self.nodes[last_node["id"]] = (last_node["lat"], last_node["lon"], last_node["tags"])
+                    last_node = None
+                if self.curr_way:
+                    self.way_handler()
+                self.curr_way = {"id": elem.attrib.get("id"), "nodes": [], "tags": {}}
+            elif elem.tag == "relation":
+                stage = 4
+                if self.curr_way:
+                    self.way_handler()
+                    self.curr_way = None
+            elif elem.tag == "bounds":
+                stage = 1
+                self.bounds = {
+                    "minLat": float(elem.attrib.get("minlat")),
+                    "minLon": float(elem.attrib.get("minlon")),
+                    "maxLat": float(elem.attrib.get("maxlat")),
+                    "maxLon": float(elem.attrib.get("maxlon"))
+                }
+                self.lat = (self.bounds["minLat"] + self.bounds["maxLat"]) * 0.5
+                self.lon = (self.bounds["minLon"] + self.bounds["maxLon"]) * 0.5
+                self.latInRadians = math.radians(self.lat)
+            elif elem.tag == "tag":
+                if stage == 2:
+                    k = elem.attrib.get("k")
+                    if k in self.node_tags:
+                        last_node["tags"][k] = elem.attrib.get("v")
+                elif stage == 3:
+                    k = elem.attrib.get("k")
+                    self.curr_way["tags"][k] = elem.attrib.get("v")
+                elif stage == 4:
+                    pass  # skip
+                else:
+                    print("Error in tag structure! Stage:", stage, "Tag:", elem.tag)
+                    break
+            elif elem.tag == "nd":
+                self.curr_way["nodes"].append(int(elem.attrib.get("ref")))
+            elif elem.tag == "member":
+                pass  # skip
+            else:
+                print("Unknown tag:", elem.tag)
+                break
+            # cleaning
+            elem.clear()
+            root.clear()
+        xml_f.close()
+
+    # Handlers for generate geometry
+    def handler_buildings(self):
+        way_nodes = self.curr_way["nodes"]
+        nodes_count = len(way_nodes) - 1
+        # a polygon must have at least 3 vertices
+        if nodes_count < 3:
+            return
+        tags = self.curr_way["tags"]
+        # compose object name
+        name = self.curr_way["id"]
+        if "addr:housenumber" in tags and "addr:street" in tags:
+            name = tags["addr:street"] + ", " + tags["addr:housenumber"]
+        elif "name" in tags:
+            name = tags["name"]
+
+        bm = bmesh.new()
+        verts = []
+        for i in range(nodes_count):
+            node = self.nodes[way_nodes[i]]
+            v = self.from_geo(node[0], node[1])
+            verts.append(bm.verts.new((v[0], v[1], 0)))
+
+        bm.faces.new(verts)
+
+        thickness = 0
+        if "height" in tags:
+            thickness, unit = parse_scalar_and_unit(tags["height"])
+        elif "building:levels" in tags:
+            thickness, unit = parse_scalar_and_unit(tags["building:levels"])
+            thickness *= 3
+        else:
+            thickness = 3
+        if thickness > 0:
+            extrude_mesh(bm, thickness)
+
+        bm.normal_update()
+        mesh = bpy.data.meshes.new(self.curr_way["id"])
+        bm.to_mesh(mesh)
+        obj = bpy.data.objects.new(name, mesh)
+        bpy.context.scene.objects.link(obj)
+        obj.select = True
+        for key in tags:
+            obj[key] = tags[key]
+        assign_materials(obj, "roof", (1.0, 0.0, 0.0), [mesh.polygons[0]])
+        assign_materials(obj, "building", (1, 0.7, 0.0), mesh.polygons[1:])
+
+    def handler_building_parts(self):
+        way_nodes = self.curr_way["nodes"]
+        nodes_count = len(way_nodes) - 1
+        # a polygon must have at least 3 vertices
+        if nodes_count < 3:
+            return
+        tags = self.curr_way["tags"]
+        # compose object name
+        name = self.curr_way["id"]
+        if "addr:housenumber" in tags and "addr:street" in tags:
+            name = tags["addr:street"] + ", " + tags["addr:housenumber"]
+        elif "name" in tags:
+            name = tags["name"]
+
+        min_height = 0
+        height = 0
+        if "min_height" in tags:
+            min_height, unit = parse_scalar_and_unit(tags["min_height"])
+        if "height" in tags:
+            height, unit = parse_scalar_and_unit(tags["height"])
+        if min_height == 0 and height == 0 and "building:levels" in tags:
+            height, unit = parse_scalar_and_unit(tags["building:levels"])
+            height *= 3
+
+        bm = bmesh.new()
+        verts = []
+        for i in range(nodes_count):
+            node = self.nodes[way_nodes[i]]
+            v = self.from_geo(node[0], node[1])
+            verts.append(bm.verts.new((v[0], v[1], min_height)))
+        bm.faces.new(verts)
+        # extrude
+        if (height - min_height) > 0:
+            extrude_mesh(bm, (height - min_height))
+        bm.normal_update()
+        mesh = bpy.data.meshes.new(self.curr_way["id"])
+        bm.to_mesh(mesh)
+        obj = bpy.data.objects.new(name, mesh)
+        bpy.context.scene.objects.link(obj)
+        obj.select = True
+        for key in tags:
+            obj[key] = tags[key]
+
+    def handler_highways(self):
+        way_nodes = self.curr_way["nodes"]
+        nodes_count = len(way_nodes)
+        # a way must have at least 2 vertices
+        if nodes_count < 2:
+            return
+        tags = self.curr_way["tags"]
+        name = tags["name"] if "name" in tags else self.curr_way["id"]
+        bm = bmesh.new()
+        prev_vertex = None
+        for i in range(nodes_count):
+            node = self.nodes[way_nodes[i]]
+            v = self.from_geo(node[0], node[1])
+            v = bm.verts.new((v[0], v[1], 0))
+            if prev_vertex:
+                bm.edges.new([prev_vertex, v])
+            prev_vertex = v
+
+        mesh = bpy.data.meshes.new(self.curr_way["id"])
+        bm.to_mesh(mesh)
+        obj = bpy.data.objects.new(name, mesh)
+        bpy.context.scene.objects.link(obj)
+        obj.select = True
+        for key in tags:
+            obj[key] = tags[key]
+
+    def handler_barrier(self):
+        way_nodes = self.curr_way["nodes"]
+        nodes_count = len(way_nodes)
+        # a wall must have at least 2 vertices
+        if nodes_count < 2:
+            return
+        tags = self.curr_way["tags"]
+        name = tags["name"] if "name" in tags else self.curr_way["id"]
+        bm = bmesh.new()
+        prev_vertex = None
+        for i in range(nodes_count):
+            node = self.nodes[way_nodes[i]]
+            v = self.from_geo(node[0], node[1])
+            v = bm.verts.new((v[0], v[1], 0))
+            if prev_vertex:
+                bm.edges.new([prev_vertex, v])
+            prev_vertex = v
+
+        height = 0
+        if "height" in tags:
+            height, unit = parse_scalar_and_unit(tags["height"])
+        # extrude
+        if height > 0:
+            extrude_edges(bm, height)
+        else:
+            extrude_edges(bm, 0.5)
+
+        bm.normal_update()
+        mesh = bpy.data.meshes.new(self.curr_way["id"])
+        bm.to_mesh(mesh)
+
+        obj = bpy.data.objects.new(name, mesh)
+        bpy.context.scene.objects.link(obj)
+        obj.select = True
+        for key in tags:
+            obj[key] = tags[key]
+        assign_materials(obj, tags["barrier"], (0.0, 0.0, 1.0), [])
+
+    def handler_naturals(self):
+        way_nodes = self.curr_way["nodes"]
+        nodes_count = len(way_nodes)
+        if nodes_count == 1:
+            # This is some point "natural".
+            # which we ignore for now (trees, etc.)
+            pass
+        nodes_count = nodes_count - 1
+        # a polygon must have at least 3 vertices
+        if nodes_count < 3:
+            return
+        tags = self.curr_way["tags"]
+        name = self.curr_way["id"]
+        if "name" in tags:
+            name = tags["name"]
+        bm = bmesh.new()
+        verts = []
+        for i in range(nodes_count):
+            node = self.nodes[way_nodes[i]]
+            v = self.from_geo(node[0], node[1])
+            verts.append(bm.verts.new((v[0], v[1], 0)))
+        bm.faces.new(verts)
+        bm.normal_update()
+        mesh = bpy.data.meshes.new(self.curr_way["id"])
+        bm.to_mesh(mesh)
+        obj = bpy.data.objects.new(name, mesh)
+        bpy.context.scene.objects.link(obj)
+        obj.select = True
+        for key in tags:
+            obj[key] = tags[key]
+        natural_type = tags["natural"]
+        color = (0.5, 0.5, 0.5)
+
+        if natural_type == "water":
+            color = (0, 0, 1)
+        assign_materials(obj, natural_type, color, [mesh.polygons[0]])
+
+    def handler_landuse(self):
+        way_nodes = self.curr_way["nodes"]
+        nodes_count = len(way_nodes)
+        nodes_count = nodes_count - 1
+        # a polygon must have at least 3 vertices
+        if nodes_count < 3:
+            return
+        tags = self.curr_way["tags"]
+        name = self.curr_way["id"]
+        if "name" in tags:
+            name = tags["name"]
+        bm = bmesh.new()
+        verts = []
+        for i in range(nodes_count):
+            node = self.nodes[way_nodes[i]]
+            v = self.from_geo(node[0], node[1])
+            verts.append(bm.verts.new((v[0], v[1], 0)))
+        bm.faces.new(verts)
+        bm.normal_update()
+        mesh = bpy.data.meshes.new(self.curr_way["id"])
+        bm.to_mesh(mesh)
+        obj = bpy.data.objects.new(name, mesh)
+        bpy.context.scene.objects.link(obj)
+        obj.select = True
+        for key in tags:
+            obj[key] = tags[key]
+        natural_type = tags["landuse"]
+        color = (0.5, 0.5, 0.5)
+        if natural_type == "grass":
+            color = (0, 1, 0)
+        assign_materials(obj, natural_type, color, [mesh.polygons[0]])
+
+    def get_handler(self):
+        # https://wiki.openstreetmap.org/wiki/Map_Features
+        if not self.curr_way:
+            return None
+        if self.curr_way["tags"].get("building", None):
+            return self.handler_buildings
+        if self.curr_way["tags"].get("building:part", None):
+            return self.handler_building_parts
+        if self.curr_way["tags"].get("highway", None):
+            return self.handler_highways
+        if self.curr_way["tags"].get("barrier", None):
+            return self.handler_barrier
+        if self.curr_way["tags"].get("natural", None):
+            return self.handler_naturals
+        if self.curr_way["tags"].get("landuse", None):
+            return self.handler_landuse
+        return None
+
+    def way_handler(self):
+        handler = self.get_handler()
+        if handler:
+            handler()
 
     def execute(self, context):
-        # setting active object if there is no active object
-        if context.mode != "OBJECT":
-            # if there is no object in the scene, only "OBJECT" mode is provided
-            if not context.scene.objects.active:
-                context.scene.objects.active = context.scene.objects[0]
-            bpy.ops.object.mode_set(mode="OBJECT")
-        
         bpy.ops.object.select_all(action="DESELECT")
-        
         name = os.path.basename(self.filepath)
-        
-        # create an empty object to parent all imported OSM objects
-        bpy.ops.object.empty_add(type="PLAIN_AXES", location=(0, 0, 0))
-        parentObject = context.active_object
-        self.parentObject = parentObject
-        parentObject.name = name
 
-        self.read_osm_file(context)
+        bpy.ops.object.empty_add(type="PLAIN_AXES", location=(0, 0, 0))
+        parent_object = context.active_object
+        parent_object.name = name
+
+        self.parse(self.filepath)
         bpy.context.scene.update()
-        
-        # perform parenting
-        context.scene.objects.active = parentObject
+
+        context.scene.objects.active = parent_object
         bpy.ops.object.parent_set()
-        
+
         bpy.ops.object.select_all(action="DESELECT")
         return {"FINISHED"}
 
-    def read_osm_file(self, context):
-        scene = context.scene
-        
-        wayHandlers = []
-        if self.importBuildings:
-            wayHandlers.append(Buildings)
-            wayHandlers.append(BuildingParts)
 
-        if self.importNaturals:
-            wayHandlers.append(Naturals)
-
-        if self.importHighways: wayHandlers.append(Highways)
-        if self.importWalls: wayHandlers.append(Walls)
-        if self.importLanduse: wayHandlers.append(Landuse)
-        
-        osm = OsmParser(self.filepath,
-            # possible values for wayHandlers and nodeHandlers list elements:
-            #    1) a string name for the module containing classes (all classes from the modules will be used as handlers)
-            #    2) a python variable representing the module containing classes (all classes from the modules will be used as handlers)
-            #    3) a python variable representing the class
-            # Examples:
-            # wayHandlers = [buildings, highways]
-            # wayHandlers = [handlers.buildings]
-            # wayHandlers = [handlers]
-            # wayHandlers = ["handlers"]
-            wayHandlers = wayHandlers
-        )
-        
-        if "latitude" in scene and "longitude" in scene:
-            lat = scene["latitude"]
-            lon = scene["longitude"]
-        else:
-            if osm.bounds and self.importHighways:
-                # If the .osm file contains the bounds tag,
-                # use its values as the extent of the imported area.
-                # Highways may go far beyond the values of the bounds tag.
-                # A user might get confused if higways are used in the calculation of the extent of the imported area.
-                bounds = osm.bounds
-                lat = (bounds["minLat"] + bounds["maxLat"])/2
-                lon = (bounds["minLon"] + bounds["maxLon"])/2
-            else:
-                lat = (osm.minLat + osm.maxLat)/2
-                lon = (osm.minLon + osm.maxLon)/2
-            scene["latitude"] = lat
-            scene["longitude"] = lon
-        
-        osm.parse(projection = TransverseMercator(lat=lat, lon=lon))
-
-
-# Only needed if you want to add into a dynamic menu
 def menu_func_import(self, context):
-    self.layout.operator(ImportOsm.bl_idname, text="OpenStreetMap (.osm)")
+    self.layout.operator(OsmParser.bl_idname, text="OpenStreetMap (.osm)")
+
 
 def register():
-    bpy.utils.register_class(ImportOsm)
+    bpy.utils.register_class(OsmParser)
     bpy.types.INFO_MT_file_import.append(menu_func_import)
 
+
 def unregister():
-    bpy.utils.unregister_class(ImportOsm)
+    bpy.utils.unregister_class(OsmParser)
     bpy.types.INFO_MT_file_import.remove(menu_func_import)
 
-# This allows you to run the script directly from blenders text editor
-# to test the addon without having to install it.
+
 if __name__ == "__main__":
     register()
-
-
-
