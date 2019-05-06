@@ -8,7 +8,7 @@ import bmesh
 bl_info = {
     "name": "Import OpenStreetMap (.osm)",
     "author": "@lapka_td",
-    "version": (1, 1, 2),
+    "version": (1, 1, 3),
     "blender": (2, 80, 0),
     "location": "File > Import > OpenStreetMap (.osm)",
     "description": "Import a file in the OpenStreetMap format (.osm)",
@@ -69,6 +69,7 @@ class OsmParser(bpy.types.Operator, ImportHelper):
     bl_label = "Import OpenStreetMap"
     bl_options = {"REGISTER"}
     filename_ext = ".osm"
+    total = 0  # debug
 
     filter_glob = bpy.props.StringProperty(
         default="*.osm",
@@ -104,6 +105,34 @@ class OsmParser(bpy.types.Operator, ImportHelper):
         description="Import landuse",
         default=True,
     )
+    minLat = bpy.props.FloatProperty(
+        name="Min lat",
+        description="Minimum latitude",
+        min=-90.0, soft_min=-90.0,
+        max=90.0, soft_max=90.0,
+        default=-90.0, precision=4,
+    )
+    maxLat = bpy.props.FloatProperty(
+        name="Max lat",
+        description="Maximum latitude",
+        min=-90.0, soft_min=-90.0,
+        max=90.0, soft_max=90.0,
+        default=90.0, precision=4,
+    )
+    minLon = bpy.props.FloatProperty(
+        name="Min lon",
+        description="Minimum longitude",
+        min=-180.0, soft_min=-180.0,
+        max=180.0, soft_max=180.0,
+        default=-180.0, precision=4,
+    )
+    maxLon = bpy.props.FloatProperty(
+        name="Max lon",
+        description="Maximum longitude",
+        min=-180.0, soft_min=-180.0,
+        max=180.0, soft_max=180.0,
+        default=180.0, precision=4,
+    )
 
     def from_geo(self, lat, lon):
         lat = math.radians(lat)
@@ -132,11 +161,15 @@ class OsmParser(bpy.types.Operator, ImportHelper):
                     if len(last_node["tags"]) == 0:
                         last_node["tags"] = None
                     self.nodes[last_node["id"]] = (last_node["lat"], last_node["lon"], last_node["tags"])
-                last_node = {"id": int(elem.attrib.get("id")),
-                             "lat": float(elem.attrib.get("lat")),
-                             "lon": float(elem.attrib.get("lon")),
-                             "tags": {}}
+                clat = float(elem.attrib.get("lat"))
+                clon = float(elem.attrib.get("lon"))
+                if self.minLat <= clat <= self.maxLat and self.minLon <= clon <= self.maxLon:
+                    last_node = {"id": int(elem.attrib.get("id")), "lat": clat, "lon": clon, "tags": {}}
+                else:
+                    last_node = None
             elif elem.tag == "way":
+                if stage != 3:
+                    print("Nodes collected:", len(self.nodes))
                 stage = 3
                 if last_node:
                     if len(last_node["tags"]) == 0:
@@ -165,7 +198,7 @@ class OsmParser(bpy.types.Operator, ImportHelper):
             elif elem.tag == "tag":
                 if stage == 2:
                     k = elem.attrib.get("k")
-                    if k in self.node_tags:
+                    if last_node and k in self.node_tags:
                         last_node["tags"][k] = elem.attrib.get("v")
                 elif stage == 3:
                     k = elem.attrib.get("k")
@@ -175,7 +208,9 @@ class OsmParser(bpy.types.Operator, ImportHelper):
                 else:
                     raise("Error in tag structure! Stage:", stage, "Tag:", elem.tag)
             elif elem.tag == "nd":
-                self.curr_way["nodes"].append(int(elem.attrib.get("ref")))
+                ref_id = int(elem.attrib.get("ref"))
+                if self.nodes.get(ref_id, None):
+                    self.curr_way["nodes"].append(ref_id)
             elif elem.tag == "member":
                 pass  # skip
             else:
@@ -429,6 +464,10 @@ class OsmParser(bpy.types.Operator, ImportHelper):
         handler = self.get_handler()
         if handler:
             handler()
+            # debug
+            self.total += 1
+            if self.total % 100 == 0:
+                print(self.total)
 
     def execute(self, context):
         bpy.ops.object.select_all(action="DESELECT")
@@ -454,19 +493,12 @@ def menu_func_import(self, context):
 
 def register():
     bpy.utils.register_class(OsmParser)
-    if hasattr(bpy.types, 'TOPBAR_MT_file_import'):
-        bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
-    else:
-        bpy.types.INFO_MT_file_import.append(menu_func_import)
+    bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
 
 
 def unregister():
     bpy.utils.unregister_class(OsmParser)
-    if hasattr(bpy.types, 'TOPBAR_MT_file_import'):
-        # 2.8+
-        bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
-    else:
-        bpy.types.INFO_MT_file_import.remove(menu_func_import)
+    bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
 
 
 if __name__ == "__main__":
