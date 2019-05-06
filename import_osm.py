@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Import OpenStreetMap (.osm)",
     "author": "Vladimir Elistratov, gtoonstra and @lapka_td",
-    "version": (1, 0, 0),
+    "version": (1, 0, 1),
     "blender": (2, 7, 7),
     "location": "File > Import > OpenStreetMap (.osm)",
     "description": "Import a file in the OpenStreetMap format (.osm)",
@@ -53,7 +53,8 @@ class TransverseMercator:
 
         lon = self.lon + math.degrees(lon)
         lat = math.degrees(lat)
-        return (lat, lon)
+        return (lat, lon)
+
 import xml.etree.cElementTree as etree
 import inspect, importlib
 
@@ -221,7 +222,8 @@ class OsmParser:
             if lon<self.minLon: self.minLon = lon
             elif lon>self.maxLon: self.maxLon = lon
         self.iterate(wayFunction, nodeFunction)
-
+
+
 import bpy, bmesh
 
 def extrudeMesh(bm, thickness):
@@ -255,7 +257,8 @@ def assignMaterials(obj, materialname, color, faces):
     obj.data.materials.append(mat) 
 
     for face in faces:
-        face.material_index = matidx
+        face.material_index = matidx
+
 
 def assignTags(obj, tags):
     for key in tags:
@@ -268,7 +271,8 @@ def parse_scalar_and_unit( htag ):
             return int(htag[:i]), htag[i:].strip()
 
     return int(htag), ""
-
+
+
 class Buildings:
     @staticmethod
     def condition(tags, way):
@@ -321,7 +325,6 @@ class Buildings:
         
         obj = bpy.data.objects.new(name, mesh)
         bpy.context.scene.objects.link(obj)
-        bpy.context.scene.update()
         
         # final adjustments
         obj.select = True
@@ -389,7 +392,6 @@ class BuildingParts:
         
         obj = bpy.data.objects.new(name, mesh)
         bpy.context.scene.objects.link(obj)
-        bpy.context.scene.update()
         
         # final adjustments
         obj.select = True
@@ -429,7 +431,6 @@ class Highways:
         
         obj = bpy.data.objects.new(name, mesh)
         bpy.context.scene.objects.link(obj)
-        bpy.context.scene.update()
         
         # final adjustments
         obj.select = True
@@ -479,7 +480,6 @@ class Walls:
         
         obj = bpy.data.objects.new(name, mesh)
         bpy.context.scene.objects.link(obj)
-        bpy.context.scene.update()
         
         # final adjustments
         obj.select = True
@@ -532,7 +532,6 @@ class Naturals:
         
         obj = bpy.data.objects.new(name, mesh)
         bpy.context.scene.objects.link(obj)
-        bpy.context.scene.update()
         
         # final adjustments
         obj.select = True
@@ -587,7 +586,6 @@ class Landuse:
         
         obj = bpy.data.objects.new(name, mesh)
         bpy.context.scene.objects.link(obj)
-        bpy.context.scene.update()
         
         # final adjustments
         obj.select = True
@@ -600,7 +598,8 @@ class Landuse:
         if naturaltype == "grass":
             color = (0,1,0)
 
-        assignMaterials( obj, naturaltype, color, [mesh.polygons[0]] )
+        assignMaterials( obj, naturaltype, color, [mesh.polygons[0]] )
+
 
 class ImportOsm(bpy.types.Operator, ImportHelper):
     """Import a file in the OpenStreetMap format (.osm)"""
@@ -666,6 +665,7 @@ class ImportOsm(bpy.types.Operator, ImportHelper):
         parentObject.name = name
 
         self.read_osm_file(context)
+        bpy.context.scene.update()
         
         # perform parenting
         context.scene.objects.active = parentObject
@@ -740,4 +740,5 @@ def unregister():
 if __name__ == "__main__":
     register()
 
-
+
+
