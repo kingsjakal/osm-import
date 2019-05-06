@@ -1,5 +1,6 @@
 import os
 import math
+import re
 import xml.etree.ElementTree as etree
 from bpy_extras.io_utils import ImportHelper
 import bpy
@@ -7,7 +8,7 @@ import bmesh
 bl_info = {
     "name": "Import OpenStreetMap (.osm)",
     "author": "@lapka_td",
-    "version": (1, 1, 1),
+    "version": (1, 1, 2),
     "blender": (2, 80, 0),
     "location": "File > Import > OpenStreetMap (.osm)",
     "description": "Import a file in the OpenStreetMap format (.osm)",
@@ -47,12 +48,11 @@ def assign_materials(obj, materialname, color, faces):
 
 
 def parse_scalar_and_unit(htag):
-    # TODO add float support
     # TODO add unit conversion
-    for i, c in enumerate(htag):
-        if not c.isdigit():
-            return int(htag[:i]), htag[i:].strip()
-    return int(htag), ""
+    m = re.match(r"^(\d+\.?\d*)(.*)$", htag)
+    if not m:
+        raise("Invalid value:", htag)
+    return float(m[1]), m[2]
 
 
 class OsmParser(bpy.types.Operator, ImportHelper):
@@ -173,15 +173,13 @@ class OsmParser(bpy.types.Operator, ImportHelper):
                 elif stage == 4:
                     pass  # skip
                 else:
-                    print("Error in tag structure! Stage:", stage, "Tag:", elem.tag)
-                    break
+                    raise("Error in tag structure! Stage:", stage, "Tag:", elem.tag)
             elif elem.tag == "nd":
                 self.curr_way["nodes"].append(int(elem.attrib.get("ref")))
             elif elem.tag == "member":
                 pass  # skip
             else:
-                print("Unknown tag:", elem.tag)
-                break
+                raise("Unknown tag:", elem.tag)
             # cleaning
             elem.clear()
             root.clear()
