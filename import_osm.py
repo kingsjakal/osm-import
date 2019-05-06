@@ -7,7 +7,7 @@ import bmesh
 bl_info = {
     "name": "Import OpenStreetMap (.osm)",
     "author": "@lapka_td",
-    "version": (1, 1, 0),
+    "version": (1, 1, 1),
     "blender": (2, 77, 0),
     "location": "File > Import > OpenStreetMap (.osm)",
     "description": "Import a file in the OpenStreetMap format (.osm)",
@@ -413,17 +413,17 @@ class OsmParser(bpy.types.Operator, ImportHelper):
         # https://wiki.openstreetmap.org/wiki/Map_Features
         if not self.curr_way:
             return None
-        if self.curr_way["tags"].get("building", None):
+        if self.curr_way["tags"].get("building", None) and self.importBuildings:
             return self.handler_buildings
-        if self.curr_way["tags"].get("building:part", None):
+        if self.curr_way["tags"].get("building:part", None) and self.importBuildings:
             return self.handler_building_parts
-        if self.curr_way["tags"].get("highway", None):
+        if self.curr_way["tags"].get("highway", None) and self.importHighways:
             return self.handler_highways
-        if self.curr_way["tags"].get("barrier", None):
+        if self.curr_way["tags"].get("barrier", None) and self.importBarriers:
             return self.handler_barrier
-        if self.curr_way["tags"].get("natural", None):
+        if self.curr_way["tags"].get("natural", None) and self.importNaturals:
             return self.handler_naturals
-        if self.curr_way["tags"].get("landuse", None):
+        if self.curr_way["tags"].get("landuse", None) and self.importLanduse:
             return self.handler_landuse
         return None
 
