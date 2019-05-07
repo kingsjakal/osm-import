@@ -8,7 +8,7 @@ import bmesh
 bl_info = {
     "name": "Import OpenStreetMap (.osm)",
     "author": "@lapka_td",
-    "version": (1, 1, 4),
+    "version": (1, 1, 5),
     "blender": (2, 76, 0),
     "location": "File > Import > OpenStreetMap (.osm)",
     "description": "Import a file in the OpenStreetMap format (.osm)",
@@ -54,7 +54,7 @@ def parse_scalar_and_unit(htag):
     # TODO add unit conversion
     m = re.match(r"^(\d+\.?\d*)(.*)$", htag)
     if not m:
-        raise("Invalid value:", htag)
+        raise Exception("Invalid value: " + htag)
     return float(m[1]), m[2]
 
 
@@ -75,7 +75,7 @@ class OsmParser(bpy.types.Operator, ImportHelper):
     radius = 6378137
     lat = 0
     lon = 0
-    latInRadians = 0
+    lat_rad = 0
     bounds = None
     bl_idname = "import_scene.osm"
     bl_label = "Import OpenStreetMap"
@@ -151,7 +151,7 @@ class OsmParser(bpy.types.Operator, ImportHelper):
         lon = math.radians(lon - self.lon)
         b = math.sin(lon) * math.cos(lat)
         x = 0.5 * self.radius * math.log((1 + b) / (1 - b))
-        y = self.radius * (math.atan(math.tan(lat) / math.cos(lon)) - self.latInRadians)
+        y = self.radius * (math.atan(math.tan(lat) / math.cos(lon)) - self.lat_rad)
         return x, y
 
     def parse(self, filename):
@@ -206,7 +206,7 @@ class OsmParser(bpy.types.Operator, ImportHelper):
                 }
                 self.lat = (self.bounds["minLat"] + self.bounds["maxLat"]) * 0.5
                 self.lon = (self.bounds["minLon"] + self.bounds["maxLon"]) * 0.5
-                self.latInRadians = math.radians(self.lat)
+                self.lat_rad = math.radians(self.lat)
             elif elem.tag == "tag":
                 if stage == 2:
                     k = elem.attrib.get("k")
@@ -218,7 +218,7 @@ class OsmParser(bpy.types.Operator, ImportHelper):
                 elif stage == 4:
                     pass  # skip
                 else:
-                    raise("Error in tag structure! Stage:", stage, "Tag:", elem.tag)
+                    raise Exception("Error in tag structure! Stage: " + str(stage) + " Tag: " + elem.tag)
             elif elem.tag == "nd":
                 ref_id = int(elem.attrib.get("ref"))
                 if self.nodes.get(ref_id, None):
@@ -226,7 +226,7 @@ class OsmParser(bpy.types.Operator, ImportHelper):
             elif elem.tag == "member":
                 pass  # skip
             else:
-                raise("Unknown tag:", elem.tag)
+                raise Exception("Unknown tag: " + elem.tag)
             # cleaning
             elem.clear()
             root.clear()
@@ -442,34 +442,87 @@ class OsmParser(bpy.types.Operator, ImportHelper):
         add_obj(obj)
         for key in tags:
             obj[key] = tags[key]
-        natural_type = tags["landuse"]
+        natural_type = tags.get("landuse", None)
+        if not natural_type:
+            natural_type = tags.get("leisure", None)
         color = (0.5, 0.5, 0.5, 1.0)
-        if natural_type == "grass":
+        if natural_type in {"grass", "allotments", "forest", "meadow", "orchard", "plant_nursery",
+                            "recreation_ground", "village_green", "vineyard"}:
             color = (0, 1, 0, 1.0)
         assign_materials(obj, natural_type, color, [mesh.polygons[0]])
 
-    def get_handler(self):
-        # https://wiki.openstreetmap.org/wiki/Map_Features
-        if not self.curr_way:
-            return None
-        if self.curr_way["tags"].get("building", None) and self.importBuildings:
-            return self.handler_buildings
-        if self.curr_way["tags"].get("building:part", None) and self.importBuildings:
-            return self.handler_building_parts
-        if self.curr_way["tags"].get("highway", None) and self.importHighways:
-            return self.handler_highways
-        if self.curr_way["tags"].get("barrier", None) and self.importBarriers:
-            return self.handler_barrier
-        if self.curr_way["tags"].get("natural", None) and self.importNaturals:
-            return self.handler_naturals
-        if self.curr_way["tags"].get("landuse", None) and self.importLanduse:
-            return self.handler_landuse
-        return None
+    def handler_amenity(self):
+        way_nodes = self.curr_way["nodes"]
+        nodes_count = len(way_nodes)
+        nodes_count = nodes_count - 1
+        # a polygon must have at least 3 vertices
+        if nodes_count < 3:
+            return
+        tags = self.curr_way["tags"]
+        name = self.curr_way["id"]
+        if "name" in tags:
+            name = tags["name"]
+        bm = bmesh.new()
+        verts = []
+        for i in range(nodes_count):
+            node = self.nodes[way_nodes[i]]
+            v = self.from_geo(node[0], node[1])
+            verts.append(bm.verts.new((v[0], v[1], 0)))
+        bm.faces.new(verts)
+        bm.normal_update()
+        mesh = bpy.data.meshes.new(self.curr_way["id"])
+        bm.to_mesh(mesh)
+        obj = bpy.data.objects.new(name, mesh)
+        add_obj(obj)
+        for key in tags:
+            obj[key] = tags[key]
+        assign_materials(obj, tags["amenity"], (0, 0, 0, 1), [mesh.polygons[0]])
 
     def way_handler(self):
-        handler = self.get_handler()
-        if handler:
-            handler()
+        if not self.curr_way:
+            return
+        # https://wiki.openstreetmap.org/wiki/Map_Features
+        handlers = []
+        if self.curr_way["tags"].get("building", None) and self.importBuildings:
+            handlers.append(self.handler_buildings)
+        if self.curr_way["tags"].get("building:part", None) and self.importBuildings:
+            handlers.append(self.handler_building_parts)
+
+        if not handlers and self.curr_way["tags"].get("amenity", None) and self.importBuildings:
+            handlers.append(self.handler_amenity)
+
+        if self.curr_way["tags"].get("highway", None) and self.importHighways:
+            handlers.append(self.handler_highways)
+        elif self.curr_way["tags"].get("cycleway", None) and self.importHighways:
+            handlers.append(self.handler_highways)
+        elif self.curr_way["tags"].get("bicycle", None) and self.importHighways:
+            handlers.append(self.handler_highways)
+        elif self.curr_way["tags"].get("aerialway", None) and self.importHighways:
+            handlers.append(self.handler_highways)
+        elif self.curr_way["tags"].get("aeroway", None) and self.importHighways:
+            handlers.append(self.handler_highways)
+        elif self.curr_way["tags"].get("busway", None) and self.importHighways:
+            handlers.append(self.handler_highways)
+        elif self.curr_way["tags"].get("railway", None) and self.importHighways:
+            handlers.append(self.handler_highways)
+        elif self.curr_way["tags"].get("waterway", None) and self.importHighways:
+            handlers.append(self.handler_highways)
+
+        if self.curr_way["tags"].get("barrier", None) and self.importBarriers:
+            handlers.append(self.handler_barrier)
+        if self.curr_way["tags"].get("natural", None) and self.importNaturals:
+            handlers.append(self.handler_naturals)
+        if self.curr_way["tags"].get("landuse", None) and self.importLanduse:
+            handlers.append(self.handler_landuse)
+        elif (self.curr_way["tags"].get("leisure", None) and self.importLanduse
+              and self.handler_buildings not in handlers and self.handler_building_parts not in handlers):
+            handlers.append(self.handler_landuse)
+
+        if not handlers and self.curr_way["tags"].get("man_made", None) and self.importHighways:
+            handlers.append(self.handler_highways)
+
+        for h in handlers:
+            h()
             # debug
             self.total += 1
             if self.total % 100 == 0:
